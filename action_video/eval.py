@@ -166,6 +166,10 @@ def generate_video(
     """
     device = model.device
 
+    # Zero out future frames so the model cannot look ahead.
+    # reactive channel will encode zeros for the masked region.
+    history_frames = history_frames * (1 - mask)
+
     seed_g = torch.Generator(device=device)
     seed_g.manual_seed(seed)
 

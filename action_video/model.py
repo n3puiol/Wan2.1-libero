@@ -370,8 +370,11 @@ class ActionConditionedVace(nn.Module):
         text_context = self.encode_text(tasks)
 
         # Encode video and masks to VACE context (frozen VAE)
+        # Zero out future frames so the model cannot look ahead through
+        # the reactive channel — matches eval-time behaviour.
         with torch.no_grad():
-            frames_list = [video[i] for i in range(B)]
+            masked_video = video * (1 - mask)
+            frames_list = [masked_video[i] for i in range(B)]
             masks_list = [mask[i] for i in range(B)]
 
             vace_ctx = self.vace_encode_frames(frames_list, masks_list)
