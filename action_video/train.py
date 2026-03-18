@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 
 import torch
-import torch.cuda.amp as amp
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -33,6 +32,17 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def setup_performance(config: ActionVideoConfig):
+    """Configure A100-optimized performance settings."""
+    if config.use_tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("TF32 enabled for matmul and cuDNN")
+    if config.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
+        logger.info("cuDNN benchmark enabled")
 
 
 def parse_args() -> ActionVideoConfig:
@@ -63,12 +73,21 @@ class Trainer:
         self.config = config
         self.device = torch.device("cuda:0")
 
+        setup_performance(config)
+
         logger.info("Initializing model...")
         self.model = ActionConditionedVace(config, device_id=0)
 
         # Move trainable modules to device
         self.model.action_tokenizer.to(self.device)
         self.model.action_adapter.to(self.device)
+
+        # torch.compile for the forward pass (A100 SM80+ supports inductor)
+        if config.compile_model:
+            logger.info("Compiling model with torch.compile (may take a minute on first step)...")
+            self.model.forward_with_actions = torch.compile(
+                self.model.forward_with_actions, mode="reduce-overhead"
+            )
 
         # Create optimizer for trainable params only
         trainable_params = self.model.get_trainable_parameters()
@@ -243,7 +262,7 @@ class Trainer:
                         pg["lr"] = lr
 
                 # Forward pass with AMP
-                with amp.autocast(dtype=self.config.param_dtype):
+                with torch.amp.autocast("cuda", dtype=self.config.param_dtype):
                     loss_dict = self.model.training_step(
                         video=video,
                         mask=mask,

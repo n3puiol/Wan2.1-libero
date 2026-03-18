@@ -17,8 +17,9 @@ class LoRALinear(nn.Module):
         in_features = original.in_features
         out_features = original.out_features
 
-        self.lora_A = nn.Parameter(torch.randn(in_features, rank) * 0.01)
+        self.lora_A = nn.Parameter(torch.empty(in_features, rank))
         self.lora_B = nn.Parameter(torch.zeros(rank, out_features))
+        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
         self.scale = alpha / rank
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -27,8 +28,13 @@ class LoRALinear(nn.Module):
         return base + lora
 
 
-def apply_lora_to_blocks(blocks: nn.ModuleList, rank: int = 16, alpha: int = 32):
-    """Apply LoRA to q, k, v, o projections in self_attn and cross_attn of each block."""
+def apply_lora_to_blocks(
+    blocks: nn.ModuleList,
+    rank: int = 16,
+    alpha: int = 32,
+    lora_ffn: bool = False,
+):
+    """Apply LoRA to attention projections and optionally FFN layers in each block."""
     for block in blocks:
         for attn_name in ["self_attn", "cross_attn"]:
             attn = getattr(block, attn_name, None)
@@ -38,6 +44,13 @@ def apply_lora_to_blocks(blocks: nn.ModuleList, rank: int = 16, alpha: int = 32)
                 original = getattr(attn, proj_name, None)
                 if original is not None and isinstance(original, nn.Linear):
                     setattr(attn, proj_name, LoRALinear(original, rank, alpha))
+
+        if lora_ffn:
+            ffn = getattr(block, "ffn", None)
+            if ffn is not None and isinstance(ffn, nn.Sequential):
+                for i, layer in enumerate(ffn):
+                    if isinstance(layer, nn.Linear):
+                        ffn[i] = LoRALinear(layer, rank, alpha)
 
 
 def get_lora_parameters(model: nn.Module) -> list:

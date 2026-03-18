@@ -122,6 +122,7 @@ class ActionConditionedVace(nn.Module):
                 self.vace_model.blocks,
                 rank=config.lora_rank,
                 alpha=config.lora_alpha,
+                lora_ffn=config.lora_ffn,
             )
 
         # Unfreeze VACE blocks if requested
