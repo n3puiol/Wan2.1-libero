@@ -180,6 +180,7 @@ def main():
 
     # Create eval dataset with the held-out repo
     eval_config = dataclasses.replace(config, repo_id=args.eval_repo_id)
+    eval_config = dataclasses.replace(eval_config, image_key="observation.images.primary")
     logger.info(f"Loading eval dataset: {args.eval_repo_id}")
     eval_dataset = LiberoVideoDataset(eval_config)
 
