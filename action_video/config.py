@@ -29,8 +29,8 @@ class ActionVideoConfig:
     target_height: int = 256
     target_width: int = 448
     num_frames: int = 13  # 4n+1 for VAE: 1 history + 12 future
-    num_history_frames: int = 2
-    num_future_frames: int = 11
+    num_history_frames: int = 3
+    num_future_frames: int = 10
 
     # Data
     repo_id: str = "HuggingFaceVLA/libero"
@@ -43,7 +43,7 @@ class ActionVideoConfig:
 
     # Training
     batch_size: int = 16
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 2
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
     num_train_steps: int = 2000
