@@ -374,13 +374,14 @@ class ActionConditionedVace(nn.Module):
         # the reactive channel — matches eval-time behaviour.
         with torch.no_grad():
             masked_video = video * (1 - mask)
-            frames_list = [masked_video[i] for i in range(B)]
+            masked_list = [masked_video[i] for i in range(B)]
             masks_list = [mask[i] for i in range(B)]
 
-            vace_ctx = self.vace_encode_frames(frames_list, masks_list)
+            vace_ctx = self.vace_encode_frames(masked_list, masks_list)
 
-            # Encode full video as target latents
-            target_latents = self.vae.encode(frames_list)  # list of [16, F_lat, H_lat, W_lat]
+            # Encode full video (not masked) as target latents
+            full_list = [video[i] for i in range(B)]
+            target_latents = self.vae.encode(full_list)  # list of [16, F_lat, H_lat, W_lat]
 
         # Flow matching: sample sigma in [0, 1] and interpolate
         # Wan convention: sigma=0 (timestep=0) is clean, sigma=1 (timestep=1000) is noise
