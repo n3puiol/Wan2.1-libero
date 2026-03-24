@@ -74,20 +74,23 @@ from .lora import apply_lora_to_blocks, get_lora_parameters
 
 class ActionConditionedVace(nn.Module):
 
-    def __init__(self, config: ActionVideoConfig, device_id: int = 0):
+    def __init__(self, config: ActionVideoConfig, device: str | torch.device = "cpu", device_id: int | None = None):
         super().__init__()
         self.config = config
-        self.device = torch.device(f"cuda:{device_id}")
+        # Backward compat: device_id=0 -> device="cuda:0"
+        if device_id is not None:
+            device = f"cuda:{device_id}"
+        self._init_device = torch.device(device)
 
         checkpoint_dir = config.checkpoint_dir
 
-        # Load frozen VAE
+        # Load frozen VAE (not an nn.Module submodule — invisible to DDP)
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device,
+            device=self._init_device,
         )
 
-        # Load frozen T5 text encoder
+        # Load frozen T5 text encoder (not an nn.Module submodule — invisible to DDP)
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
@@ -99,6 +102,17 @@ class ActionConditionedVace(nn.Module):
         # Load VaceWanModel from pretrained
         self.vace_model = VaceWanModel.from_pretrained(checkpoint_dir)
         self.vace_model.eval().requires_grad_(False)
+
+        # Swap inactive/reactive weight rows in vace_patch_embedding so the
+        # pre-trained content-processing weights (channels 0-15, originally
+        # inactive) align with the reactive channel where history data now
+        # lives, and vice-versa.
+        with torch.no_grad():
+            w = self.vace_model.vace_patch_embedding.weight  # [out, 96, k_t, k_h, k_w]
+            inactive_w = w[:, :16].clone()
+            reactive_w = w[:, 16:32].clone()
+            w[:, :16] = reactive_w
+            w[:, 16:32] = inactive_w
 
         # Action conditioning modules (trainable)
         self.action_tokenizer = ActionTokenizer(
@@ -130,14 +144,35 @@ class ActionConditionedVace(nn.Module):
             self.vace_model.vace_blocks.requires_grad_(True)
             self.vace_model.vace_patch_embedding.requires_grad_(True)
 
-        # Move to device
-        self.vace_model.to(self.device)
-        self.action_tokenizer.to(self.device)
-        self.action_adapter.to(self.device)
+        # When device != "cpu", move everything immediately (single-GPU / eval path)
+        if self._init_device.type != "cpu":
+            self.vace_model.to(self._init_device)
+            self.action_tokenizer.to(self._init_device)
+            self.action_adapter.to(self._init_device)
 
         # Store stride/patch for VACE encoding
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+
+    @property
+    def device(self) -> torch.device:
+        """Device of trainable parameters (valid after init or accelerator.prepare)."""
+        return self.action_adapter[-1].weight.device
+
+    @property
+    def current_device(self) -> torch.device:
+        """Alias for device."""
+        return self.device
+
+    def setup_frozen_components(self, device: torch.device):
+        """Move frozen VAE and T5 to target device. Call after accelerator.prepare()."""
+        self.vae.model.to(device)
+        self.vae.mean = self.vae.mean.to(device)
+        self.vae.std = self.vae.std.to(device)
+        self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+        self.vae.device = device
+        if not self.config.t5_cpu:
+            self.text_encoder.model.to(device)
 
     def get_trainable_parameters(self) -> list:
         """Get all parameters that should be trained."""
@@ -160,12 +195,13 @@ class ActionConditionedVace(nn.Module):
     @torch.no_grad()
     def encode_text(self, texts: list[str]) -> list[torch.Tensor]:
         """Encode text prompts using T5 (on CPU if configured)."""
+        device = self.current_device
         if self.config.t5_cpu:
             context = self.text_encoder(texts, torch.device("cpu"))
-            return [t.to(self.device) for t in context]
+            return [t.to(device) for t in context]
         else:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder(texts, self.device)
+            self.text_encoder.model.to(device)
+            context = self.text_encoder(texts, device)
             self.text_encoder.model.cpu()
             return context
 
@@ -173,19 +209,23 @@ class ActionConditionedVace(nn.Module):
     def vace_encode_frames(self, frames: list[torch.Tensor], masks: list[torch.Tensor]):
         """Encode video frames and masks into VACE context.
 
+        History frames are placed in the reactive channel (channels 16-31)
+        as conditioning reference for generation.  Future regions go to the
+        inactive channel (zeros, since frames are pre-masked).
+
         Args:
-            frames: list of [3, T, H, W] video tensors
-            masks: list of [1, T, H, W] binary mask tensors (0=known, 1=generate)
+            frames: list of [3, T, H, W] video tensors (future already zeroed)
+            masks: list of [1, T, H, W] binary mask tensors (0=history, 1=future)
 
         Returns:
             vace_context: list of [96, T_lat, H_lat, W_lat] tensors
         """
         masks_binary = [torch.where(m > 0.5, 1.0, 0.0) for m in masks]
 
-        # Inactive: known regions (history), zeros where mask=1
-        inactive = [f * (1 - m) for f, m in zip(frames, masks_binary)]
-        # Reactive: to-generate regions (future), zeros where mask=0
-        reactive = [f * m for f, m in zip(frames, masks_binary)]
+        # Inactive: future regions (zeros, since frames are pre-masked)
+        inactive = [f * m for f, m in zip(frames, masks_binary)]
+        # Reactive: history frames as conditioning reference
+        reactive = [f * (1 - m) for f, m in zip(frames, masks_binary)]
 
         inactive_latents = self.vae.encode(inactive)
         reactive_latents = self.vae.encode(reactive)
@@ -344,6 +384,17 @@ class ActionConditionedVace(nn.Module):
             (h * w) / (self.patch_size[1] * self.patch_size[2]) * f
         )
 
+    def forward(
+        self,
+        video: torch.Tensor,
+        mask: torch.Tensor,
+        actions: torch.Tensor,
+        tasks: list[str],
+        vace_context_scale: float = 1.0,
+    ) -> dict:
+        """Forward pass — delegates to training_step. Required for DDP."""
+        return self.training_step(video, mask, actions, tasks, vace_context_scale)
+
     def training_step(
         self,
         video: torch.Tensor,
@@ -365,6 +416,7 @@ class ActionConditionedVace(nn.Module):
             dict with 'loss'
         """
         B = video.shape[0]
+        device = self.current_device
 
         # Encode text (cached on CPU if t5_cpu)
         text_context = self.encode_text(tasks)
@@ -386,7 +438,7 @@ class ActionConditionedVace(nn.Module):
         # Flow matching: sample sigma in [0, 1] and interpolate
         # Wan convention: sigma=0 (timestep=0) is clean, sigma=1 (timestep=1000) is noise
         # x_sigma = (1 - sigma) * target + sigma * noise
-        sigma = torch.rand(B, device=self.device)
+        sigma = torch.rand(B, device=device)
         noise = [torch.randn_like(z) for z in target_latents]
 
         x_t = []

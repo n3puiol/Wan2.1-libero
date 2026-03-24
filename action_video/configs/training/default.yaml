@@ -1,0 +1,47 @@
+# Training configuration
+batch_size: 16
+gradient_accumulation_steps: 1
+learning_rate: 1e-5
+weight_decay: 0.01
+num_train_steps: 5000
+warmup_steps: 200
+gradient_clip: 1.0
+amp_dtype: bfloat16
+
+# LoRA
+lora_rank: 32
+lora_alpha: 64
+lora_ffn: false
+use_lora: true
+train_vace_blocks: false
+gradient_checkpointing: true
+
+# Performance
+use_tf32: true
+compile_model: false
+cudnn_benchmark: true
+
+# Logging and checkpointing
+log_interval: 10
+save_interval: 20
+wandb_enabled: true
+max_checkpoints: 3
+
+# Resume
+resume_checkpoint: null
+
+# Optimizer
+optimizer_type: adamw
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_eps: 1e-8
+
+# Scheduler
+lr_schedule: cosine
+min_lr: 1e-7
+
+# DataLoader
+num_workers: 4
+shuffle: true
+pin_memory: true
+drop_last: true

@@ -1,0 +1,41 @@
+defaults:
+  - model: default
+  - training: default
+  - _self_
+
+# Datasets (list of dataset configs)
+datasets:
+  - repo_id: HuggingFaceVLA/libero
+    image_key: observation.images.image
+    action_key: action
+    state_key: observation.state
+    task_key: task
+
+  - repo_id: n3puiol/libero_cosmos_policy_lerobot
+    image_key: observation.images.primary
+    action_key: action
+    state_key: observation.state
+    task_key: task
+
+  - repo_id: n3puiol/libero_failures_lerobot
+    image_key: observation.images.primary
+    action_key: action
+    state_key: observation.state
+    task_key: task
+
+# Horizon settings
+horizon: 30
+horizon_skip: 5
+
+# Experiment settings
+exp_name: action_vace_libero_${training.batch_size}_${now:%Y-%m-%d}
+project_name: action_vace
+checkpoint_dir: /scratch/s5649552/checkpoints
+
+# Hydra settings
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

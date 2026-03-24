@@ -1,5 +1,5 @@
 """
-LiberoVideoDataset: loads Libero data via LeRobot and prepares it for
+LiberoVideoDataset: loads data via StreamingLeRobotDataset and prepares it for
 VACE-style video prediction with action conditioning.
 
 Each sample contains:
@@ -9,6 +9,7 @@ Each sample contains:
   - task: str task description
 """
 
+import dataclasses
 import logging
 import random
 from typing import Dict, List
@@ -16,11 +17,24 @@ from typing import Dict, List
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torchvision import transforms as T
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 
 from .config import ActionVideoConfig
 
+
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class DatasetConfig:
+    """Per-dataset configuration for multi-dataset training."""
+    repo_id: str
+    image_key: str = "observation.images.image"
+    action_key: str = "action"
+    state_key: str = "observation.state"
+    task_key: str = "task"
 
 
 class NormStat:
@@ -63,21 +77,69 @@ def normalize_action(x: torch.Tensor, stats: NormStat) -> torch.Tensor:
     return x.clamp(-1.0, 1.0)
 
 
-class LiberoVideoDataset(torch.utils.data.Dataset):
+def _process_item(
+    item: dict,
+    image_key: str,
+    action_key: str,
+    task_key: str,
+    target_h: int,
+    target_w: int,
+    num_history: int,
+    action_stats: NormStat | None,
+) -> dict:
+    """Shared processing logic for both map and streaming datasets."""
+    images = item[image_key].float()
 
-    def __init__(self, config: ActionVideoConfig):
+    if images.max() > 1.0:
+        images = images / 255.0
+    images = images * 2.0 - 1.0
+
+    T, C, H, W = images.shape
+    if H != target_h or W != target_w:
+        images = F.interpolate(
+            images, size=(target_h, target_w),
+            mode="bilinear", align_corners=False,
+        )
+
+    video = images.permute(1, 0, 2, 3)
+
+    mask = torch.zeros(1, T, target_h, target_w)
+    mask[:, num_history:, :, :] = 1.0
+
+    actions = None
+    if action_key in item:
+        actions = item[action_key].float()
+        if action_stats is not None:
+            actions = normalize_action(actions, action_stats)
+
+    task = item.get(task_key, "A robot arm performing a manipulation task.")
+
+    return {
+        "video": video,
+        "mask": mask,
+        "actions": actions,
+        "task": task,
+    }
+
+
+class MapLiberoVideoDataset(torch.utils.data.Dataset):
+    """Map-style dataset for eval/inference (supports __getitem__ and __len__)."""
+
+    def __init__(self, config: ActionVideoConfig, dataset_config: DatasetConfig | None = None):
         self.config = config
         self.num_history = config.num_history_frames
         self.num_future = config.num_future_frames
         self.target_h = config.target_height
         self.target_w = config.target_width
 
-        meta = LeRobotDatasetMetadata(config.repo_id)
+        self.repo_id = dataset_config.repo_id if dataset_config else config.repo_id
+        self.image_key = dataset_config.image_key if dataset_config else config.image_key
+        self.action_key = dataset_config.action_key if dataset_config else config.action_key
+        self.task_key = dataset_config.task_key if dataset_config else config.task_key
+
+        meta = LeRobotDatasetMetadata(self.repo_id)
         fps = meta.fps
 
-        # Build delta_timestamps
-        # History: frames going backwards from current, spaced by horizon_skip
-        # Future: frames going forward, spaced by horizon_skip
         skip = config.horizon_skip
         history_ts = [
             -(self.num_history - 1 - i) * skip / fps
@@ -89,29 +151,28 @@ class LiberoVideoDataset(torch.utils.data.Dataset):
         ]
 
         delta_timestamps = {
-            config.image_key: history_ts + future_ts,
+            self.image_key: history_ts + future_ts,
         }
-        if config.action_key in meta.features:
-            delta_timestamps[config.action_key] = future_ts
+        if self.action_key in meta.features:
+            delta_timestamps[self.action_key] = future_ts
 
         self.dataset = LeRobotDataset(
-            config.repo_id,
+            self.repo_id,
             delta_timestamps=delta_timestamps,
         )
 
-        # Build action normalization stats
         self.action_stats = None
         stats = self.dataset.meta.stats
-        if config.action_key in stats:
+        if self.action_key in stats:
             self.action_stats = NormStat(
-                mean=np.array(stats[config.action_key]["mean"]),
-                std=np.array(stats[config.action_key]["std"]),
-                min_val=np.array(stats[config.action_key]["min"]),
-                max_val=np.array(stats[config.action_key]["max"]),
+                mean=np.array(stats[self.action_key]["mean"]),
+                std=np.array(stats[self.action_key]["std"]),
+                min_val=np.array(stats[self.action_key]["min"]),
+                max_val=np.array(stats[self.action_key]["max"]),
             )
 
         logger.info(
-            f"LiberoVideoDataset: {len(self.dataset)} samples, "
+            f"MapLiberoVideoDataset({self.repo_id}): {len(self.dataset)} samples, "
             f"fps={fps}, history={self.num_history}, future={self.num_future}"
         )
 
@@ -129,48 +190,181 @@ class LiberoVideoDataset(torch.utils.data.Dataset):
 
     def _load_sample(self, index: int) -> dict:
         item = self.dataset[index]
-        cfg = self.config
+        return _process_item(item, self.image_key, self.action_key, self.task_key,
+                             self.target_h, self.target_w, self.num_history, self.action_stats)
 
-        # Images: [num_frames, C, H, W] from LeRobot
-        images = item[cfg.image_key]  # [T, C, H, W]
-        images = images.float()
 
-        # Normalize to [-1, 1] (LeRobot gives [0, 1] after transforms)
-        if images.max() > 1.0:
-            images = images / 255.0
-        images = images * 2.0 - 1.0
+# Backward compat alias — eval scripts import this name
+LiberoVideoDataset = MapLiberoVideoDataset
 
-        # Resize to target resolution
-        T, C, H, W = images.shape
-        if H != self.target_h or W != self.target_w:
-            images = F.interpolate(
-                images, size=(self.target_h, self.target_w),
-                mode="bilinear", align_corners=False,
+
+class StreamingLiberoVideoDataset(torch.utils.data.IterableDataset):
+    """Streaming dataset for training (no __getitem__, uses StreamingLeRobotDataset)."""
+
+    def __init__(self, config: ActionVideoConfig, dataset_config: DatasetConfig | None = None):
+        super().__init__()
+        self.config = config
+        self.num_history = config.num_history_frames
+        self.num_future = config.num_future_frames
+        self.target_h = config.target_height
+        self.target_w = config.target_width
+
+        # Per-dataset keys (from DatasetConfig if provided, else from ActionVideoConfig)
+        self.repo_id = dataset_config.repo_id if dataset_config else config.repo_id
+        self.image_key = dataset_config.image_key if dataset_config else config.image_key
+        self.action_key = dataset_config.action_key if dataset_config else config.action_key
+        self.task_key = dataset_config.task_key if dataset_config else config.task_key
+
+        # PIL -> Tensor transform (StreamingLeRobotDataset returns raw PIL images)
+        self._image_transforms = T.ToTensor()
+
+        # Create streaming dataset to read metadata (fps, features, stats)
+        self._streaming_dataset = StreamingLeRobotDataset(
+            self.repo_id,
+            image_transforms=self._image_transforms,
+            streaming=True,
+        )
+        fps = self._streaming_dataset.fps
+
+        # Build delta_timestamps
+        # History: frames going backwards from current, spaced by horizon_skip
+        # Future: frames going forward, spaced by horizon_skip
+        skip = config.horizon_skip
+        history_ts = [
+            -(self.num_history - 1 - i) * skip / fps
+            for i in range(self.num_history)
+        ]
+        future_ts = [
+            (i + 1) * skip / fps
+            for i in range(self.num_future)
+        ]
+
+        delta_timestamps = {
+            self.image_key: history_ts + future_ts,
+        }
+        if self.action_key in self._streaming_dataset.meta.features:
+            delta_timestamps[self.action_key] = future_ts
+
+        # Build action normalization stats from metadata
+        self.action_stats = None
+        stats = self._streaming_dataset.meta.stats
+        if self.action_key in stats:
+            self.action_stats = NormStat(
+                mean=np.array(stats[self.action_key]["mean"]),
+                std=np.array(stats[self.action_key]["std"]),
+                min_val=np.array(stats[self.action_key]["min"]),
+                max_val=np.array(stats[self.action_key]["max"]),
             )
 
-        # Convert to [C, T, H, W] for VACE
-        video = images.permute(1, 0, 2, 3)  # [3, T, H, W]
+        # Re-create the streaming dataset with delta_timestamps
+        self._streaming_dataset = StreamingLeRobotDataset(
+            self.repo_id,
+            image_transforms=self._image_transforms,
+            delta_timestamps=delta_timestamps,
+            streaming=True,
+        )
 
-        # Create mask: 0 for history (known), 1 for future (to generate)
-        mask = torch.zeros(1, T, self.target_h, self.target_w)
-        mask[:, self.num_history:, :, :] = 1.0
+        # Monkey-patch _get_delta_frames to handle PIL images in parquet-based datasets.
+        # The upstream _get_delta_frames calls torch.stack on raw PIL images when
+        # image columns are stored as parquet (not video). We wrap it to convert PIL -> tensor.
+        _orig_get_delta_frames = self._streaming_dataset._get_delta_frames
+        _to_tensor = self._image_transforms
 
-        # Actions
-        actions = None
-        if cfg.action_key in item:
-            actions = item[cfg.action_key].float()  # [T_future, action_dim]
-            if self.action_stats is not None:
-                actions = normalize_action(actions, self.action_stats)
+        def _patched_get_delta_frames(dataset_iterator, item):
+            from PIL import Image
+            query_result, padding = _orig_get_delta_frames.__wrapped__(
+                self._streaming_dataset, dataset_iterator, item
+            ) if hasattr(_orig_get_delta_frames, '__wrapped__') else _orig_get_delta_frames(dataset_iterator, item)
+            return query_result, padding
 
-        # Task description
-        task = item.get(cfg.task_key, "A robot arm performing a manipulation task.")
+        # Deeper patch: override the problematic torch.stack inside _get_delta_frames
+        # by converting PIL images to tensors in the frame collection step.
+        import types
+        from PIL import Image as PILImage
 
-        return {
-            "video": video,
-            "mask": mask,
-            "actions": actions,
-            "task": task,
-        }
+        original_method = self._streaming_dataset._get_delta_frames
+
+        def _safe_get_delta_frames(self_ds, dataset_iterator, item):
+            """Patched _get_delta_frames that converts PIL images to tensors before stacking."""
+            query_result = {}
+            padding = {}
+
+            for key, delta_indices in self_ds.delta_indices.items():
+                if key in self_ds.meta.video_keys:
+                    continue
+
+                target_frames = []
+                is_pad = []
+                delta_results = {}
+
+                negative_deltas = sorted([d for d in delta_indices if d < 0], reverse=True)
+                positive_deltas = sorted([d for d in delta_indices if d > 0])
+                zero_deltas = [d for d in delta_indices if d == 0]
+
+                for delta in zero_deltas:
+                    delta_results[delta] = (item[key], False)
+
+                last_successful_frame = item[key]
+                lookahead_failed = False
+
+                for delta in negative_deltas:
+                    try:
+                        past_item = dataset_iterator.peek_backward(-delta)
+                        if past_item.get("episode_index") == item.get("episode_index"):
+                            delta_results[delta] = (past_item[key], False)
+                            last_successful_frame = past_item[key]
+                        else:
+                            delta_results[delta] = (last_successful_frame, True)
+                    except Exception:
+                        delta_results[delta] = (last_successful_frame, True)
+
+                last_successful_frame = item[key]
+                for delta in positive_deltas:
+                    if lookahead_failed:
+                        delta_results[delta] = (last_successful_frame, True)
+                        continue
+                    try:
+                        future_item = dataset_iterator.peek_forward(delta)
+                        if future_item.get("episode_index") == item.get("episode_index"):
+                            delta_results[delta] = (future_item[key], False)
+                            last_successful_frame = future_item[key]
+                        else:
+                            delta_results[delta] = (last_successful_frame, True)
+                            lookahead_failed = True
+                    except Exception:
+                        delta_results[delta] = (last_successful_frame, True)
+                        lookahead_failed = True
+
+                for delta in delta_indices:
+                    frame, is_padded = delta_results[delta]
+                    # Convert PIL images to tensors
+                    if isinstance(frame, PILImage.Image):
+                        frame = _to_tensor(frame)
+                    target_frames.append(frame)
+                    is_pad.append(is_padded)
+
+                if target_frames:
+                    query_result[key] = torch.stack(target_frames)
+                    padding[f"{key}_is_pad"] = torch.BoolTensor(is_pad)
+
+            return query_result, padding
+
+        self._streaming_dataset._get_delta_frames = types.MethodType(
+            _safe_get_delta_frames, self._streaming_dataset
+        )
+
+        logger.info(
+            f"StreamingLiberoVideoDataset({self.repo_id}): streaming, "
+            f"fps={fps}, history={self.num_history}, future={self.num_future}"
+        )
+
+    def __iter__(self):
+        for item in self._streaming_dataset:
+            try:
+                yield _process_item(item, self.image_key, self.action_key, self.task_key,
+                                    self.target_h, self.target_w, self.num_history, self.action_stats)
+            except Exception as e:
+                logger.warning(f"Error processing item in {self.repo_id}: {e}. Skipping.")
 
 
 def collate_fn(batch: List[dict]) -> Dict[str, torch.Tensor]:
@@ -220,3 +414,16 @@ def collate_fn(batch: List[dict]) -> Dict[str, torch.Tensor]:
         "action_mask": action_mask,
         "task": tasks,
     }
+
+
+def create_multi_dataset(
+    config: ActionVideoConfig,
+    dataset_configs: list[DatasetConfig],
+) -> torch.utils.data.IterableDataset:
+    """Create a (possibly chained) streaming dataset from multiple dataset configs."""
+    datasets = []
+    for ds_cfg in dataset_configs:
+        datasets.append(StreamingLiberoVideoDataset(config, dataset_config=ds_cfg))
+    if len(datasets) == 1:
+        return datasets[0]
+    return torch.utils.data.ChainDataset(datasets)

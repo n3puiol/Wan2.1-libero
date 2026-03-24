@@ -1,0 +1,32 @@
+# Model configuration (from Wan2.1-VACE-1.3B)
+
+# Paths
+checkpoint_dir: Wan2.1-VACE-1.3B
+t5_checkpoint: models_t5_umt5-xxl-enc-bf16.pth
+t5_tokenizer: google/umt5-xxl
+vae_checkpoint: Wan2.1_VAE.pth
+
+# Architecture
+dim: 1536
+num_heads: 12
+num_layers: 30
+vae_stride: [4, 8, 8]
+patch_size: [1, 2, 2]
+num_train_timesteps: 1000
+
+# Action conditioning
+max_action_dim: 32
+action_hidden_dim: 256
+max_action_len: 32
+
+# VACE frame settings
+target_height: 256
+target_width: 448
+num_frames: 13
+num_history_frames: 7
+num_future_frames: 6
+
+# T5
+t5_cpu: false
+t5_dtype: bfloat16
+text_len: 256
