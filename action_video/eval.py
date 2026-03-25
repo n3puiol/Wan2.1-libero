@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .config import ActionVideoConfig
-from .dataset import LiberoVideoDataset, collate_fn
+from .dataset import DatasetConfig, LiberoVideoDataset, collate_fn
 from .model import ActionConditionedVace
 
 # Import schedulers from wan without triggering wan/__init__.py
@@ -95,6 +95,16 @@ def parse_args():
     # Data overrides
     parser.add_argument("--sample_indices", type=str, default=None,
                         help="Comma-separated sample indices to evaluate")
+
+    # Dataset overrides (for multi-dataset eval)
+    parser.add_argument("--repo_id", type=str, default=None,
+                        help="Override dataset repo_id")
+    parser.add_argument("--image_key", type=str, default=None,
+                        help="Override image key")
+    parser.add_argument("--action_key", type=str, default=None,
+                        help="Override action key")
+    parser.add_argument("--task_key", type=str, default=None,
+                        help="Override task key")
 
     return parser.parse_args()
 
@@ -319,8 +329,8 @@ def save_comparison_grid(
     gen = (gen_video.clamp(-1, 1) + 1) / 2
 
     T = min(gt.shape[1], gen.shape[1])
-    num_cols = min(T, 8)
-    indices = torch.linspace(0, T - 1, num_cols).long()
+    num_cols = T
+    indices = torch.arange(T)
 
     gt_frames = [gt[:, i] for i in indices]   # list of [3, H, W]
     gen_frames = [gen[:, i] for i in indices]
@@ -347,9 +357,17 @@ def main():
 
     model, config = load_model(args)
 
-    # Create dataset
+    # Create dataset (with optional per-dataset overrides)
     logger.info("Loading dataset...")
-    dataset = LiberoVideoDataset(config)
+    ds_config = None
+    if args.repo_id:
+        ds_config = DatasetConfig(
+            repo_id=args.repo_id,
+            image_key=args.image_key or config.image_key,
+            action_key=args.action_key or config.action_key,
+            task_key=args.task_key or config.task_key,
+        )
+    dataset = LiberoVideoDataset(config, dataset_config=ds_config)
 
     # Select sample indices
     if args.sample_indices:
@@ -370,7 +388,7 @@ def main():
         task = sample["task"]
 
         if actions is None:
-            actions = torch.zeros(config.num_future_frames, 7)
+            actions = torch.zeros(config.num_future_frames, config.max_action_dim)
 
         # Generate
         gen_video = generate_video(

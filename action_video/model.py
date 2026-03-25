@@ -194,16 +194,39 @@ class ActionConditionedVace(nn.Module):
 
     @torch.no_grad()
     def encode_text(self, texts: list[str]) -> list[torch.Tensor]:
-        """Encode text prompts using T5 (on CPU if configured)."""
+        """Encode text prompts using T5 (cached; on CPU if configured).
+
+        Task descriptions are a small fixed set so we cache embeddings
+        keyed by string to avoid re-running T5 after the first encounter.
+        """
+        if not hasattr(self, "_text_cache"):
+            self._text_cache: dict[str, torch.Tensor] = {}
+
         device = self.current_device
-        if self.config.t5_cpu:
-            context = self.text_encoder(texts, torch.device("cpu"))
-            return [t.to(device) for t in context]
-        else:
-            self.text_encoder.model.to(device)
-            context = self.text_encoder(texts, device)
-            self.text_encoder.model.cpu()
-            return context
+        result: list[torch.Tensor | None] = [None] * len(texts)
+        uncached_texts: list[str] = []
+        uncached_indices: list[int] = []
+
+        for i, t in enumerate(texts):
+            if t in self._text_cache:
+                result[i] = self._text_cache[t]
+            else:
+                uncached_texts.append(t)
+                uncached_indices.append(i)
+
+        if uncached_texts:
+            if self.config.t5_cpu:
+                encoded = self.text_encoder(uncached_texts, torch.device("cpu"))
+                encoded = [e.to(device) for e in encoded]
+            else:
+                self.text_encoder.model.to(device)
+                encoded = self.text_encoder(uncached_texts, device)
+                self.text_encoder.model.cpu()
+            for idx, enc in zip(uncached_indices, encoded):
+                self._text_cache[texts[idx]] = enc
+                result[idx] = enc
+
+        return result  # type: ignore[return-value]
 
     @torch.no_grad()
     def vace_encode_frames(self, frames: list[torch.Tensor], masks: list[torch.Tensor]):
@@ -361,9 +384,12 @@ class ActionConditionedVace(nn.Module):
         kwargs["hints"] = hints
         kwargs["context_scale"] = vace_context_scale
 
-        # Main transformer blocks
-        for block in model.blocks:
-            if self.config.gradient_checkpointing and self.training:
+        # Main transformer blocks — only checkpoint the second half
+        # (later blocks have larger activations; early blocks are cheap)
+        num_blocks = len(model.blocks)
+        ckpt_start = num_blocks // 2
+        for i, block in enumerate(model.blocks):
+            if self.config.gradient_checkpointing and self.training and i >= ckpt_start:
                 x_emb = torch.utils.checkpoint.checkpoint(
                     block, x_emb, use_reentrant=False, **kwargs
                 )

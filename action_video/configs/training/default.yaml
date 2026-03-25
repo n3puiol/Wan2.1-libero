@@ -1,5 +1,5 @@
 # Training configuration
-batch_size: 16
+batch_size: 24
 gradient_accumulation_steps: 1
 learning_rate: 1e-5
 weight_decay: 0.01
@@ -18,7 +18,7 @@ gradient_checkpointing: true
 
 # Performance
 use_tf32: true
-compile_model: false
+compile_model: true
 cudnn_benchmark: true
 
 # Logging and checkpointing
@@ -41,7 +41,7 @@ lr_schedule: cosine
 min_lr: 1e-7
 
 # DataLoader
-num_workers: 4
+num_workers: 6
 shuffle: true
 pin_memory: true
 drop_last: true

@@ -125,7 +125,7 @@ class Trainer:
         if config.compile_model and torch.cuda.is_available():
             if self.is_main:
                 logger.info("Compiling model with torch.compile...")
-            self.model = torch.compile(self.model, mode="default")
+            self.model = torch.compile(self.model, mode="reduce-overhead")
 
         # Training state
         self.step = 0
